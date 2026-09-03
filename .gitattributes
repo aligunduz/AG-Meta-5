@@ -1,0 +1,11 @@
+# Tum metin dosyalari depoda LF ile saklanir ve LF ile checkout edilir.
+# Windows / Colab / Codex arasinda gidip gelirken CRLF gurultusunu onler.
+* text=auto eol=lf
+
+# Ikili dosyalar dokunulmaz
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pickle binary
+*.pth binary
+*.pyc binary
