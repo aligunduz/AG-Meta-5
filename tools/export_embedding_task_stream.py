@@ -56,14 +56,33 @@ def export_split(
 
     # Dataset normalde domain bilgisini döndürmüyor.
     # Seçilen domain indeksini burada yakalıyoruz.
-    original_sample_domain_idx = dataset._sample_domain_idx
+    total_tasks = len(dataset)
+    n_domains = len(dataset.domains)
 
-    def tracked_sample_domain_idx():
-        idx = original_sample_domain_idx()
+    base_count = total_tasks // n_domains
+    remainder = total_tasks % n_domains
+
+    domain_schedule = []
+
+    for domain_idx in range(n_domains):
+        count = base_count + (1 if domain_idx < remainder else 0)
+        domain_schedule.extend([domain_idx] * count)
+
+    rng = np.random.RandomState(seed)
+    rng.shuffle(domain_schedule)
+
+    schedule_pos = 0
+
+    def balanced_sample_domain_idx():
+        nonlocal schedule_pos
+
+        idx = domain_schedule[schedule_pos]
+        schedule_pos += 1
+
         dataset._last_domain_idx = idx
         return idx
 
-    dataset._sample_domain_idx = tracked_sample_domain_idx
+    dataset._sample_domain_idx = balanced_sample_domain_idx
 
     tasks = []
 
