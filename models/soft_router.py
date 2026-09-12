@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 
 from . import encoders
-
+from contextlib import nullcontext
+from copy import deepcopy
 
 class SoftRouter(nn.Module):
     """
@@ -42,16 +43,29 @@ class SoftRouter(nn.Module):
             raise ValueError("tau must be finite and positive.")
 
         # Same encoder loader used by the embedding extraction script.
-        checkpoint = torch.load(
-            encoder_ckpt,
-            map_location="cpu",
-            weights_only=False,
+        checkpoint = (
+            encoder_ckpt
+            if isinstance(encoder_ckpt, dict)
+            else torch.load(
+                encoder_ckpt,
+                map_location="cpu",
+                weights_only=False,
+            )
         )
+        self.encoder_spec = {
+            "encoder": checkpoint["encoder"],
+            "encoder_args": deepcopy(checkpoint["encoder_args"]),
+        }
         self.encoder = encoders.load(checkpoint).float()
         self.encoder.requires_grad_(False)
         self.encoder.eval()
 
-        with np.load(geometry_path, allow_pickle=False) as data:
+        geometry_source = (
+            nullcontext(geometry_path)
+            if isinstance(geometry_path, dict)
+            else np.load(geometry_path, allow_pickle=False)
+        )
+        with geometry_source as data:
             geometry = {
                 key: np.array(data[key], dtype=np.float64, copy=True)
                 for key in [

@@ -17,6 +17,8 @@ import models
 import utils
 import utils.optimizers as optimizers
 
+from models.soft_anchor import SoftAnchorModel
+
 
 class NullSummaryWriter(object):
   def add_scalar(self, *args, **kwargs):
@@ -190,15 +192,66 @@ def main(config):
 
   inner_args = utils.config_inner_args(config.get('inner_args'))
   if config.get('load'):
-    ckpt = torch.load(config['load'])
+    ckpt = torch.load(
+      config['load'], map_location='cpu', weights_only=False
+    )
     config['encoder'] = ckpt['encoder']
     config['encoder_args'] = ckpt['encoder_args']
     config['classifier'] = ckpt['classifier']
     config['classifier_args'] = ckpt['classifier_args']
-    model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
+    model = models.load(
+      ckpt, load_clf=(not inner_args['reset_classifier'])
+    ).cuda()
     optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
     start_epoch = ckpt['training']['epoch'] + 1
     max_va = ckpt['training']['max_va']
+  elif (config.get('soft_anchor') or {}).get('enabled', False):
+    soft_cfg = config['soft_anchor']
+
+    if not inner_args['first_order']:
+      raise ValueError("Soft anchor requires first_order=True.")
+    if inner_args['reset_classifier']:
+      raise ValueError("Soft anchor requires reset_classifier=False.")
+    if use_gradient_transport:
+      raise ValueError("Soft anchor requires gradient transport disabled.")
+
+    root_ckpt = torch.load(
+      soft_cfg['root_ckpt'],
+      map_location='cpu',
+      weights_only=False,
+    )
+
+    # Preserve the architecture metadata used by the existing project.
+    for key in (
+        'encoder', 'encoder_args',
+        'classifier', 'classifier_args'):
+      config[key] = root_ckpt[key]
+
+    if config['classifier_args']['n_way'] != config['train']['n_way']:
+      raise ValueError("Root classifier and training n_way do not match.")
+
+    model = SoftAnchorModel(
+      root_ckpt=soft_cfg['root_ckpt'],
+      encoder_ckpt=soft_cfg['encoder_ckpt'],
+      geometry_path=soft_cfg['geometry_path'],
+      top_k=soft_cfg.get('top_k', 2),
+      tau=soft_cfg.get('tau', 0.5),
+    ).cuda()
+
+    # A new experiment starts from root weights with a fresh optimizer.
+    # Frozen router/root parameters receive no gradients.
+    optimizer, lr_scheduler = optimizers.make(
+      config['optimizer'],
+      model.parameters(),
+      **config['optimizer_args'],
+    )
+    start_epoch = 1
+    max_va = 0.
+
+    yaml.dump(
+      config,
+      open(os.path.join(ckpt_path, 'config.yaml'), 'w'),
+    )
   else:
     config['encoder_args'] = config.get('encoder_args') or dict()
     config['classifier_args'] = config.get('classifier_args') or dict()
@@ -406,14 +459,40 @@ def main(config):
       'config': config,
       'encoder': config['encoder'],
       'encoder_args': config['encoder_args'],
-      'encoder_state_dict': model_.encoder.state_dict(),
       'classifier': config['classifier'],
       'classifier_args': config['classifier_args'],
-      'classifier_state_dict': model_.classifier.state_dict(),
-      'gradient_transport_state_dict':
-        model_.gradient_transport_logits.state_dict(),
       'training': training,
     }
+
+    if isinstance(model_, SoftAnchorModel):
+      ckpt.update({
+        'model_type': 'soft_anchor',
+        'checkpoint_version': 1,
+        'router_encoder_spec': model_.router.encoder_spec,
+
+        # Includes the anchor bank, frozen root, router encoder,
+        # PCA transformation and fixed centers.
+        'model_state_dict': model_.state_dict(),
+
+        # These values are not tensors, so save them explicitly.
+        'soft_anchor_args': {
+          'n_anchors': model_.n_anchors,
+          'top_k': model_.router.top_k,
+          'tau': model_.router.tau,
+        },
+
+        # Preserve the parameter ordering used by AnchorBank.
+        'anchor_parameter_names': list(
+          model_.anchor_bank.parameter_names
+        ),
+      })
+    else:
+      ckpt.update({
+        'encoder_state_dict': model_.encoder.state_dict(),
+        'classifier_state_dict': model_.classifier.state_dict(),
+        'gradient_transport_state_dict':
+          model_.gradient_transport_logits.state_dict(),
+      })
 
     torch.save(ckpt, os.path.join(ckpt_path, 'epoch-last.pth'))
     torch.save(trlog, os.path.join(ckpt_path, 'trlog.pth'))

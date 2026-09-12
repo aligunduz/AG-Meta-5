@@ -133,7 +133,9 @@ def main(config):
     collate_fn=datasets.collate_fn, num_workers=8, pin_memory=True,
     prefetch_factor=4, persistent_workers=True)
 
-  ckpt = torch.load(config['load'])
+  ckpt = torch.load(
+    config['load'], map_location='cpu', weights_only=False
+  )
   inner_args = utils.config_inner_args(config.get('inner_args'))
   ckpt_config = ckpt.get('config', {})
   run_dir = os.path.dirname(config.get('load') or '.') or '.'
@@ -148,7 +150,9 @@ def main(config):
       precision_config[key] = config[key]
   use_amp, amp_dtype, amp_dtype_name, _, allow_tf32 = \
     utils.config_cuda_precision(precision_config)
-  model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
+  model = models.load(
+    ckpt, load_clf=(not inner_args['reset_classifier'])
+  ).cuda()
   ckpt_training = ckpt.get('training', {})
 
   if args.efficient:

@@ -46,6 +46,13 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None):
   Returns:
     model (MAML): a meta model with a pre-trained encoder.
   """
+  if ckpt.get('model_type') == 'soft_anchor':
+    if not load_clf or clf_name is not None or clf_args is not None:
+      raise ValueError(
+        "Soft-anchor checkpoints require their saved classifiers."
+      )
+    from .soft_anchor import SoftAnchorModel
+    return SoftAnchorModel.from_checkpoint(ckpt)
   enc = encoders.load(ckpt)
   if load_clf:
     clf = classifiers.load(ckpt)
