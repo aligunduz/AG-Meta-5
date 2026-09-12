@@ -145,9 +145,31 @@ class MAML(Module):
     with torch.enable_grad():
       logits = self._inner_forward(x, params, episode)
       loss = F.cross_entropy(logits, y)
-      grads = autograd.grad(loss, params.values(),
-        create_graph=(not detach and not inner_args['first_order']),
-        only_inputs=True, allow_unused=True)
+      # Keep all parameters in the forward pass, but adapt only
+      # the parameters permitted by inner_args.
+      excluded = tuple(inner_args['frozen']) + (
+        'temp', 'gradient_transport_logits',
+      )
+      adaptable = OrderedDict(
+        (name, param)
+        for name, param in params.items()
+        if param.requires_grad
+        and not any(token in name for token in excluded)
+      )
+
+      if adaptable:
+        values = autograd.grad(
+          loss,
+          tuple(adaptable.values()),
+          create_graph=(not detach and not inner_args['first_order']),
+          only_inputs=True,
+          allow_unused=True,
+        )
+        grads_by_name = dict(zip(adaptable.keys(), values))
+      else:
+        grads_by_name = {}
+
+      grads = [grads_by_name.get(name) for name in params]
 
       updated_params = OrderedDict()
       for (name, param), grad in zip(params.items(), grads):
@@ -178,7 +200,9 @@ class MAML(Module):
             grad = gate * grad
           updated_param = param - lr * grad
         if detach:
-          updated_param = updated_param.detach().requires_grad_(True)
+          updated_param = updated_param.detach().requires_grad_(
+            param.requires_grad
+          )
         updated_params[name] = updated_param
 
     return updated_params, mom_buffer
@@ -239,6 +263,87 @@ class MAML(Module):
 
     return params
 
+  def forward_with_params(
+          self,
+          x_shot,
+          x_query,
+          y_shot,
+          initial_params,
+          inner_args,
+          meta_train,
+          episode=0):
+    """
+    Adapt ONE task from externally supplied initialization.
+
+    x_shot: [support, C, H, W]
+    x_query: [query, C, H, W]
+    y_shot: [support]
+    initial_params: encoder/classifier parameter dictionary
+
+    Returns:
+      Query logits: [query, n_way]
+    """
+    if x_shot.dim() != 4 or x_query.dim() != 4:
+      raise ValueError("Expected one task's support and query images.")
+    if y_shot.dim() != 1 or x_shot.size(0) != y_shot.size(0):
+      raise ValueError("Support images and labels do not match.")
+
+    expected = OrderedDict(
+      (name, param)
+      for name, param in self.named_parameters()
+      if name.startswith(('encoder.', 'classifier.'))
+    )
+    if set(initial_params) != set(expected):
+      raise ValueError(
+        "Initialization must contain every encoder/classifier parameter."
+      )
+
+    params = OrderedDict()
+    for name, reference in expected.items():
+      value = initial_params[name]
+      if value.shape != reference.shape:
+        raise ValueError("Parameter shape mismatch: " + name)
+      if value.device != x_shot.device:
+        raise ValueError("Parameter device mismatch: " + name)
+
+      if meta_train:
+        # Preserve the graph connecting the mixture to the anchors.
+        params[name] = value
+      else:
+        # Adapt a temporary task model without linking to the anchor bank.
+        excluded = inner_args['frozen'] + [
+          'temp', 'gradient_transport_logits',
+        ]
+        adapt = not any(token in name for token in excluded)
+        params[name] = value.detach().requires_grad_(adapt)
+
+    self.train()
+    if not meta_train:
+      for module in self.modules():
+        if isinstance(module, BatchNorm2d) and not module.is_episodic():
+          module.eval()
+
+    # Reuse the existing inner-loop implementation.
+    # Enable gradients even when validation calls us under no_grad().
+    with torch.enable_grad():
+      updated_params = self._adapt(
+        x_shot,
+        y_shot,
+        params,
+        episode,
+        inner_args,
+        meta_train,
+        use_gradient_transport=False,
+      )
+
+    with torch.set_grad_enabled(meta_train):
+      self.eval()
+      logits = self._inner_forward(
+        x_query, updated_params, episode
+      )
+
+    self.train(meta_train)
+    return logits
   def forward(
           self,
           x_shot,
