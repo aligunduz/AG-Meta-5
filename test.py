@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader
 import datasets
 import models
 import utils
-
+from models.soft_anchor import SoftAnchorModel
+from utils.routing_metrics import AnchorRoutingMeter
 
 class WandbLogger(object):
   def __init__(self, config, args, run_name, run_dir):
@@ -161,6 +162,21 @@ def main(config):
   if config.get('_parallel'):
     model = nn.DataParallel(model)
   model_for_log = model.module if config.get('_parallel') else model
+  routing_meter = None
+  routing_hook = None
+
+  if isinstance(model_for_log, SoftAnchorModel):
+    routing_meter = AnchorRoutingMeter(model_for_log.n_anchors)
+    routing_meter.set_phase('test')
+    routing_hook = model_for_log.router.register_forward_hook(
+      routing_meter.hook
+    )
+
+    wandb_logger.update_summary({
+      'routing/n_anchors': model_for_log.n_anchors,
+      'routing/top_k': model_for_log.router.top_k,
+      'routing/tau': model_for_log.router.tau,
+    })
 
   utils.log('num params: {}'.format(utils.compute_n_params(model)))
   utils.log('gradient transport: {}'.format(
@@ -236,6 +252,9 @@ def main(config):
     acc_percent = acc_mean * 100
     ci95_percent = ci95 * 100
     wandb_rows.append([epoch, acc_mean, acc_percent, ci95, ci95_percent])
+    routing_metrics = (
+      routing_meter.metrics() if routing_meter is not None else {}
+    )
     wandb_logger.log({
       'test/epoch': epoch,
       'test/accuracy': acc_mean,
@@ -254,8 +273,15 @@ def main(config):
       'inner_loop/nan_grad_rate': nan_grad_rate,
       'inner_loop/nan_grad_events': nan_grad_events,
       'gradient_transport/enabled': int(bool(use_gradient_transport)),
+      **routing_metrics,
     }, step=epoch)
 
+
+  if routing_meter is not None:
+    wandb_logger.update_summary(routing_meter.metrics())
+
+  if routing_hook is not None:
+    routing_hook.remove()
   final_ci95 = float(utils.mean_confidence_interval(va_lst))
   final_acc = float(aves_va.item())
   final_acc_percent = final_acc * 100
