@@ -18,7 +18,7 @@ import utils
 import utils.optimizers as optimizers
 
 from models.soft_anchor import SoftAnchorModel
-
+from threading import Lock
 
 class NullSummaryWriter(object):
   def add_scalar(self, *args, **kwargs):
@@ -147,6 +147,74 @@ def make_ckpt_name(config, args):
     ckpt_name += '_' + args.tag
   return ckpt_name
 
+class AnchorRoutingMeter:
+  """Accumulates router outputs without affecting model gradients."""
+
+  def __init__(self, n_anchors):
+    self.n_anchors = n_anchors
+    self.lock = Lock()
+    self.reset()
+
+  def reset(self):
+    with self.lock:
+      self.phase = 'train'
+      self.stats = {}
+
+  def set_phase(self, phase):
+    with self.lock:
+      self.phase = phase
+
+  def hook(self, module, inputs, output):
+    weights = output['weights'].detach().double().cpu().numpy()
+    indices = output['indices'].detach().cpu().numpy()
+
+    nearest = np.bincount(
+      indices[:, 0], minlength=self.n_anchors)
+    selected = np.bincount(
+      indices.reshape(-1), minlength=self.n_anchors)
+
+    with self.lock:
+      if self.phase not in self.stats:
+        self.stats[self.phase] = {
+          'tasks': 0,
+          'nearest': np.zeros(self.n_anchors, dtype=np.int64),
+          'selected': np.zeros(self.n_anchors, dtype=np.int64),
+          'weight_sum': np.zeros(self.n_anchors),
+          'effective_sum': 0.,
+        }
+
+      stats = self.stats[self.phase]
+      stats['tasks'] += len(weights)
+      stats['nearest'] += nearest
+      stats['selected'] += selected
+      stats['weight_sum'] += weights.sum(axis=0)
+      stats['effective_sum'] += (
+        1. / np.square(weights).sum(axis=1)
+      ).sum()
+
+  def metrics(self):
+    result = {}
+    with self.lock:
+      for phase, stats in self.stats.items():
+        n = stats['tasks']
+        if n == 0:
+          continue
+
+        prefix = f'{phase}/routing'
+        result[f'{prefix}/tasks'] = int(n)
+        result[f'{prefix}/effective_anchors'] = float(
+          stats['effective_sum'] / n)
+
+        for k in range(self.n_anchors):
+          anchor = f'{prefix}/anchor_{k}'
+          result[f'{anchor}/nearest_count'] = int(stats['nearest'][k])
+          result[f'{anchor}/selected_count'] = int(stats['selected'][k])
+          result[f'{anchor}/selected_fraction'] = float(
+            stats['selected'][k] / n)
+          result[f'{anchor}/weight_share'] = float(
+            stats['weight_sum'][k] / n)
+
+    return result
 
 def main(config):
   random.seed(0)
@@ -286,11 +354,21 @@ def main(config):
   timer_elapsed, timer_epoch = utils.Timer(), utils.Timer()
   scaler = amp.GradScaler('cuda', enabled=use_grad_scaler)
 
+  routing_meter = None
+  routing_hook = None
+  routing_model = model.module if config.get('_parallel') else model
+
+  if isinstance(routing_model, SoftAnchorModel):
+    routing_meter = AnchorRoutingMeter(routing_model.n_anchors)
+    routing_hook = routing_model.router.register_forward_hook(
+      routing_meter.hook)
   aves_keys = ['tl', 'ta', 'vl', 'va']
   trlog = {k: [] for k in aves_keys}
 
   for epoch in range(start_epoch, config['epoch'] + 1):
     timer_epoch.start()
+    if routing_meter is not None:
+      routing_meter.reset()
     aves = {k: utils.AverageMeter() for k in aves_keys}
 
     model.train()
@@ -340,6 +418,8 @@ def main(config):
     eval_this_epoch = eval_val and (
       epoch % val_interval == 0 or epoch == config['epoch'])
     if eval_this_epoch:
+      if routing_meter is not None:
+        routing_meter.set_phase('val')
       model.eval()
       np.random.seed(0)
 
@@ -438,6 +518,14 @@ def main(config):
       wandb_metrics['val/loss'] = aves['vl']
       wandb_metrics['val/accuracy'] = aves['va']
       wandb_metrics['val/best_accuracy'] = max(max_va, aves['va'])
+
+    if routing_meter is not None:
+      routing_metrics = routing_meter.metrics()
+      wandb_metrics.update(routing_metrics)
+
+      for key, value in routing_metrics.items():
+        writer.add_scalar(key, value, epoch)
+
     wandb_logger.log(wandb_metrics, step=epoch)
 
     log_str += ', {} {}/{}'.format(t_epoch, t_elapsed, t_estimate)
@@ -505,6 +593,9 @@ def main(config):
 
     writer.flush()
 
+
+  if routing_hook is not None:
+    routing_hook.remove()
   wandb_logger.log_model_artifacts(ckpt_path)
   wandb_logger.finish()
   writer.close()
